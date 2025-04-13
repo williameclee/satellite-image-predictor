@@ -1,0 +1,17 @@
+# LaTeX files
+*.aux
+*.log
+
+# Python cache
+__pycache__
+
+# Training data and models (saved locally)
+training-data
+models
+
+# Secrets and unrelated files
+notes.txt
+secrets
+scrapped
+literature
+writings
