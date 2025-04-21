@@ -6,58 +6,7 @@ import numpy as np
 import random
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from tqdm import tqdm
-
-
-class DEMDiffusionModel(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, time_emb_dim=128, cond_dim=4):
-        super().__init__()
-
-        self.time_embedding = nn.Sequential(
-            SinusoidalPosEmb(time_emb_dim),
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
-
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
-
-        self.down1 = DownBlock(in_channels, 64, time_emb_dim)
-        self.down2 = DownBlock(64, 128, time_emb_dim)
-        self.down3 = DownBlock(128, 256, time_emb_dim)
-        self.down4 = DownBlock(256, 512, time_emb_dim)
-
-        self.middle = ResBlock(512, 512, time_emb_dim)
-
-        self.up3 = UpBlock(512, 256, 256, time_emb_dim)
-        self.up2 = UpBlock(256, 128, 128, time_emb_dim)
-        self.up1 = UpBlock(128, 64, 64, time_emb_dim)
-
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(64, out_channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x, t, cond):
-        t_emb = self.time_embedding(t)
-        cond_emb = self.cond_mlp(cond)
-        combined_emb = t_emb + cond_emb  # shape: [B, time_emb_dim]
-
-        d1_out, skip1 = self.down1(x, combined_emb)
-        d2_out, skip2 = self.down2(d1_out, combined_emb)
-        d3_out, skip3 = self.down3(d2_out, combined_emb)
-        d4_out, _ = self.down4(d3_out, combined_emb)
-
-        mid = self.middle(d4_out, combined_emb)
-
-        up3_out = self.up3(mid, skip3, combined_emb)
-        up2_out = self.up2(up3_out, skip2, combined_emb)
-        up1_out = self.up1(up2_out, skip1, combined_emb)
-
-        return self.final_conv(up1_out)
+import dem_dataset
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -76,7 +25,7 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_emb_dim):
+    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
         super().__init__()
         self.norm1 = nn.BatchNorm2d(in_channels)
         self.act1 = nn.SiLU()
@@ -84,7 +33,7 @@ class ResBlock(nn.Module):
 
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, out_channels),
+            nn.Linear(time_emb_dim + cond_dim, out_channels),
         )
 
         self.norm2 = nn.BatchNorm2d(out_channels)
@@ -96,13 +45,14 @@ class ResBlock(nn.Module):
         else:
             self.residual_conv = nn.Identity()
 
-    def forward(self, x, t_emb):
+    def forward(self, x, t, c):
         h = self.norm1(x)
         h = self.act1(h)
         h = self.conv1(h)
 
-        time_out = self.time_mlp(t_emb).unsqueeze(-1).unsqueeze(-1)
-        h = h + time_out
+        tc = torch.cat([t, c], dim=1)
+        time_cond = self.time_mlp(tc).unsqueeze(-1).unsqueeze(-1)
+        h = h + time_cond
 
         h = self.norm2(h)
         h = self.act2(h)
@@ -112,33 +62,117 @@ class ResBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_emb_dim):
+    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
         super().__init__()
-        self.block1 = ResBlock(in_channels, out_channels, time_emb_dim)
-        self.block2 = ResBlock(out_channels, out_channels, time_emb_dim)
+        self.block1 = ResBlock(in_channels, out_channels, time_emb_dim, cond_dim)
+        self.block2 = ResBlock(out_channels, out_channels, time_emb_dim, cond_dim)
         self.pool = nn.MaxPool2d(2)
 
-    def forward(self, x, t_emb):
-        x = self.block1(x, t_emb)
-        x = self.block2(x, t_emb)
+    def forward(self, x, t, c):
+        x = self.block1(x, t, c)
+        x = self.block2(x, t, c)
         return self.pool(x), x
 
 
 class UpBlock(nn.Module):
-    def __init__(self, up_in_channels, skip_channels, out_channels, time_emb_dim):
+    def __init__(
+        self, up_in_channels, skip_channels, out_channels, time_emb_dim, cond_dim
+    ):
         super().__init__()
         self.upconv = nn.ConvTranspose2d(up_in_channels, out_channels, 2, stride=2)
-        self.block1 = ResBlock(out_channels + skip_channels, out_channels, time_emb_dim)
-        self.block2 = ResBlock(out_channels, out_channels, time_emb_dim)
+        self.block1 = ResBlock(
+            out_channels + skip_channels, out_channels, time_emb_dim, cond_dim
+        )
+        self.block2 = ResBlock(out_channels, out_channels, time_emb_dim, cond_dim)
 
-    def forward(self, x, skip, t_emb):
+    def forward(self, x, skip, t, c):
         x = self.upconv(x)
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(x, size=skip.shape[2:], mode="nearest")
         x = torch.cat([x, skip], dim=1)
-        x = self.block1(x, t_emb)
-        x = self.block2(x, t_emb)
+        x = self.block1(x, t, c)
+        x = self.block2(x, t, c)
         return x
+
+
+class DEMDiffusionModel(nn.Module):
+    def __init__(
+        self,
+        in_channels=1,
+        out_channels=1,
+        time_emb_dim=128,
+        cond_dim=4,
+        base_channels=64,
+    ):
+        super().__init__()
+        self.time_embedding = nn.Sequential(
+            SinusoidalPosEmb(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+        )
+
+        self.down1 = DownBlock(in_channels, base_channels, time_emb_dim, cond_dim)
+        self.down2 = DownBlock(base_channels, base_channels * 2, time_emb_dim, cond_dim)
+        self.down3 = DownBlock(
+            base_channels * 2, base_channels * 4, time_emb_dim, cond_dim
+        )
+        self.down4 = DownBlock(
+            base_channels * 4, base_channels * 8, time_emb_dim, cond_dim
+        )
+
+        self.middle = ResBlock(
+            base_channels * 8, base_channels * 8, time_emb_dim, cond_dim
+        )
+
+        self.up3 = UpBlock(
+            base_channels * 8,
+            base_channels * 4,
+            base_channels * 4,
+            time_emb_dim,
+            cond_dim,
+        )
+        self.up2 = UpBlock(
+            base_channels * 4,
+            base_channels * 2,
+            base_channels * 2,
+            time_emb_dim,
+            cond_dim,
+        )
+        self.up1 = UpBlock(
+            base_channels * 2, base_channels, base_channels, time_emb_dim, cond_dim
+        )
+
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(base_channels, out_channels, kernel_size=1),
+        )
+
+        self.aux_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(base_channels, base_channels),
+            nn.ReLU(),
+            nn.Linear(base_channels, 3),
+        )
+
+    def forward(self, x, t, c):
+        t_emb = self.time_embedding(t)
+
+        d1_out, skip1 = self.down1(x, t_emb, c)
+        d2_out, skip2 = self.down2(d1_out, t_emb, c)
+        d3_out, skip3 = self.down3(d2_out, t_emb, c)
+        d4_out, _ = self.down4(d3_out, t_emb, c)
+
+        mid = self.middle(d4_out, t_emb, c)
+
+        up3_out = self.up3(mid, skip3, t_emb, c)
+        up2_out = self.up2(up3_out, skip2, t_emb, c)
+        up1_out = self.up1(up2_out, skip1, t_emb, c)
+
+        denoised = self.final_conv(up1_out)
+        aux_out = self.aux_head(up1_out)
+
+        return denoised, aux_out
 
 
 def compute_slope_map(x):
@@ -214,10 +248,12 @@ def train_demdiffusionmodel(
         if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available() else "cpu"
     ),
-    l2loss_weight=1.0,
-    tvloss_weight=0.01,
-    slope_scale=5.0,
-    cond_dim=4,
+    dem_loss_weight=1.0,
+    stats_loss_weight=0.01,
+    stats_dim=4,
+    # data loader params
+    num_workers=8,
+    pin_memory=True,
 ):
     if subset_fraction < 1.0:
         num_epochs = round(round(num_epochs / subset_fraction))
@@ -227,50 +263,84 @@ def train_demdiffusionmodel(
 
     print(f"Using device: {device}")
 
+    num_workers = 0 if dataset.preload_to_ram else num_workers
+    persistent_workers = not dataset.preload_to_ram
+    num_samples = max(int(len(dataset) * subset_fraction), 1)
+
     model, optimiser, model_path = load_model(
-        save_model, model, dataset, learning_rate, device, cond_dim=cond_dim
+        save_model, model, dataset, learning_rate, device, cond_dim=stats_dim
     )
 
     loss_prev = np.inf
+
     betas = cosine_beta_schedule(num_timesteps)
-    alphas_cumprod = np.cumprod(1.0 - betas)
+    alphas = np.insert(np.cumprod(1.0 - betas), 0, 1.0)  # so index 1 corresponds to t=1
+    alphas = torch.tensor(alphas, dtype=torch.float32, device=device)
 
     for epoch in range(num_epochs):
-        num_samples = int(len(dataset) * subset_fraction)
         indices = random.sample(range(len(dataset)), num_samples)
         sampler = SubsetRandomSampler(indices)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             sampler=sampler,
-            num_workers=4,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
+
         model.train()
         epoch_loss = 0
+
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            x0, cond = batch
-            x0 = x0.to(device)
-            cond = cond.to(device)
+            dem, stats = batch
+            dem = dem.to(device)
+            stats = stats.to(device)
 
-            t = torch.randint(1, num_timesteps, (x0.size(0),), device=device).long()
-            alpha = torch.tensor(
-                alphas_cumprod[t.cpu().numpy()], dtype=torch.float32, device=device
-            ).view(-1, 1, 1, 1)
+            # 1. Sample timestep
+            timestep = torch.randint(1, num_timesteps, (dem.size(0),), device=device)
+            alpha = alphas[timestep].view(-1, 1, 1, 1)
 
-            noise = torch.randn_like(x0)
-            xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * noise
+            # 2. Forward diffusion
+            noise = torch.randn_like(dem)
+            dem_noisy = alpha.sqrt() * dem + (1 - alpha).sqrt() * noise
 
-            pred_noise = model(xt, t.float() / num_timesteps, cond)
-            mse_loss = F.mse_loss(pred_noise, noise)
+            # 3. Predict noise + aux
+            t = timestep.float() / num_timesteps
+            noise_pred, stats_pred = model(dem_noisy, t, stats)
 
-            with torch.no_grad():
-                x0_pred = (xt - (1 - alpha).sqrt() * pred_noise) / alpha.sqrt()
-                slope = compute_slope_map(x0)
-                slope_weight = 1.0 + slope_scale * slope
-                weighted_l2 = ((x0_pred - x0) ** 2 * slope_weight).mean()
+            # 4. Noise prediction loss (standard DDPM)
+            noise_loss = F.mse_loss(noise_pred, noise).sqrt()
 
-            tv_reg = total_variation(x0_pred)
-            loss = mse_loss + l2loss_weight * weighted_l2 + tvloss_weight * tv_reg
+            # 5. Auxiliary constraint losses
+            min_pred, mean_pred, max_pred = (
+                stats_pred[:, 1],
+                stats_pred[:, 0],
+                stats_pred[:, 2],
+            )
+
+            min_pred = torch.clamp(min_pred, min=0.0)
+            mean_pred = torch.clamp(mean_pred, min=min_pred, max=max_pred)
+            stats_pred = torch.stack([mean_pred, min_pred, max_pred], dim=1)
+
+            # 6. Auxiliary regression loss (match stats)
+            stats_loss = F.mse_loss(stats_pred, stats[:, :3]).sqrt()
+
+            # 7. Reconstruct x0 from predicted noise
+            alpha_ref = 0.5
+            dem_pred_ref = (dem_noisy - np.sqrt(alpha_ref) * noise_pred) / np.sqrt(
+                alpha_ref
+            )
+            dem_pred_ref = torch.clamp(dem_pred_ref, -1.0, 1.0)  # optional safety
+
+            dem_loss = F.mse_loss(dem_pred_ref, dem).sqrt()
+
+            # 8. Total loss
+            loss = (
+                noise_loss
+                + dem_loss_weight * dem_loss
+                + stats_loss_weight * 1e-2 * stats_loss
+            )
 
             optimiser.zero_grad()
             loss.backward()
@@ -278,25 +348,43 @@ def train_demdiffusionmodel(
 
             epoch_loss += loss.item()
 
-        if loss > loss_prev * 100:
+        epoch_loss /= len(dataloader)
+        if epoch_loss > loss_prev * 1000:
             print(
-                f"Epoch {round((epoch+1)*subset_fraction):04d}/{round(num_epochs*subset_fraction):04d}  Loss: {loss:.3f}. Loss diverged, back tracking."
+                f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d}  Loss: {epoch_loss:.3f}. Loss diverged, back tracking."
             )
-            model = DEMDiffusionModel(cond_dim=cond_dim)
+            model = DEMDiffusionModel(cond_dim=stats_dim)
             model.load_state_dict(torch.load(model_path, map_location=device))
             model.to(device)
         else:
-            loss_prev = loss
+            loss_prev = epoch_loss
             if save_model:
                 torch.save(
                     model.state_dict(),
                     model_path,
                 )
                 print(
-                    f"Epoch {round((epoch+1)*subset_fraction):04d}/{round(num_epochs*subset_fraction):04d}  Loss: {loss:.3f}. Model saved"
+                    f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d}  Loss: {epoch_loss:.3f}. Model saved"
                 )
             else:
                 print(
-                    f"Epoch {round((epoch+1)*subset_fraction):04d}/{round(num_epochs*subset_fraction):04d}  Loss: {loss:.3f}"
+                    f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d}  Loss: {epoch_loss:.3f}"
                 )
     return model
+
+
+def normalise_batch(x, mean, min_val, max_val, eps=1e-5):
+    """
+    Normalize batched DEM using per-sample mean/min/max from cond.
+    x: [B, 1, H, W]
+    mean, min_val, max_val: [B, 1, 1, 1]
+    Returns: [B, 1, H, W]
+    """
+    denom = torch.clamp(max_val - min_val, min=eps)
+    x_norm = (x - mean) / denom
+    return x_norm
+
+
+def denormalise_batch(x_norm, mean, min_val, max_val):
+    denom = torch.clamp(max_val - min_val, min=1e-5)
+    return x_norm * denom + mean
