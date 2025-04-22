@@ -39,15 +39,24 @@ class SatelliteDataset(Dataset):
                 raise FileNotFoundError(f"Dataset directory {data_dir} not found.")
         self.data_dir = data_dir
 
-        self.tiles = sorted(
-            [f for f in os.listdir(data_dir) if f.endswith("_met.json")]
-        )
-
         self.file_loaded = False
         if preload_to_ram:
+            self.h5_path = save_dataset_to_h5(self, be_quiet=False, only_check=True)
+            if self.h5_path is None:
+                print(f"Dataset not found in {self.h5_path}, converting...")
+                self.tiles = sorted(
+                    [f for f in os.listdir(data_dir) if f.endswith("_met.json")]
+                )
+            else:
+                print(f"Dataset found in {self.h5_path}")
             self.h5_path = save_dataset_to_h5(self, be_quiet=False)
             self.h5_content = h5py.File(self.h5_path, "r")
+            self.tiles = list(self.h5_content.keys())
             self.file_loaded = True
+        else:
+            self.tiles = sorted(
+                [f for f in os.listdir(data_dir) if f.endswith("_met.json")]
+            )
 
     def __len__(self):
         return len(self.tiles)
@@ -55,9 +64,11 @@ class SatelliteDataset(Dataset):
     def __getitem__(self, idx):
         meta_file = self.tiles[idx]
         if self.preload_to_ram and self.file_loaded:
-            key = meta_file.replace("_met.json", "")
+            key = meta_file
             return {
-                "target_image": torch.from_numpy(self.h5_content[key]["target_image"][:]),
+                "target_image": torch.from_numpy(
+                    self.h5_content[key]["target_image"][:]
+                ),
                 "geoinfo_spatial": torch.from_numpy(
                     self.h5_content[key]["geoinfo_spatial"][:]
                 ),
@@ -119,7 +130,7 @@ class SatelliteDataset(Dataset):
             }
 
 
-def save_dataset_to_h5(dataset, output_path=None, be_quiet=False):
+def save_dataset_to_h5(dataset, output_path=None, be_quiet=False, only_check=False):
     if output_path is None:
         output_name = (
             f"{os.path.basename(dataset.data_dir)}-K{'_'.join(dataset.geoinfo_keys)}.h5"
@@ -131,6 +142,8 @@ def save_dataset_to_h5(dataset, output_path=None, be_quiet=False):
         if not be_quiet:
             print(f"Output file {output_path} already exists.")
         return output_path
+    elif only_check:
+        return None
 
     with h5py.File(output_path, "w") as h5f:
         for i in range(len(dataset)):

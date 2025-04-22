@@ -21,33 +21,46 @@ class SatelliteDiffusionUNet(nn.Module):
         self.time_embed = TimeEmbedding(embed_dim)
         self.cond_encoder = ConditionEncoder(aux_input_dim, embed_dim)
 
-        self.enc1 = DownBlock(in_channels, base_channels, embed_dim)
-        self.enc2 = DownBlock(base_channels, base_channels * 2, embed_dim)
-        self.enc3 = DownBlock(base_channels * 2, base_channels * 4, embed_dim)
+        # Downsampling blocks
+        self.down1 = DownBlock(in_channels, base_channels, embed_dim)
+        self.down2 = DownBlock(base_channels, base_channels * 2, embed_dim)
+        self.down3 = DownBlock(base_channels * 2, base_channels * 4, embed_dim)
+        self.down4 = DownBlock(base_channels * 4, base_channels * 8, embed_dim)
 
-        self.middle = ResidualBlock(base_channels * 4, base_channels * 4, embed_dim)
+        # Bottleneck
+        self.middle = ResidualBlock(base_channels * 8, base_channels * 8, embed_dim)
 
-        self.dec3 = UpBlock(base_channels * 4, base_channels * 2, embed_dim)
-        self.dec2 = UpBlock(base_channels * 2, base_channels, embed_dim)
-        self.dec1 = UpBlock(base_channels, base_channels // 2, embed_dim)
+        # Upsampling blocks (with skip channels)
+        self.up3 = UpBlock(
+            base_channels * 8, base_channels * 4, base_channels * 4, embed_dim
+        )
+        self.up2 = UpBlock(
+            base_channels * 4, base_channels * 2, base_channels * 2, embed_dim
+        )
+        self.up1 = UpBlock(base_channels * 2, base_channels, base_channels, embed_dim)
+        self.up0 = UpBlock(base_channels, 0, base_channels // 2, embed_dim)
+
+        # Final 1x1 convolution to project to output channels (e.g. 3 for RGB)
         self.final = nn.Conv2d(base_channels // 2, out_channels, kernel_size=1)
 
     def forward(self, x, t, aux):
         t_emb = self.time_embed(t)
         aux_emb = self.cond_encoder(aux)
 
-        x1 = self.enc1(x, t_emb, aux_emb)
-        x2 = self.enc2(x1, t_emb, aux_emb)
-        x3 = self.enc3(x2, t_emb, aux_emb)
+        x1, s1 = self.down1(x, t_emb, aux_emb)
+        x2, s2 = self.down2(x1, t_emb, aux_emb)
+        x3, s3 = self.down3(x2, t_emb, aux_emb)
+        x4, _ = self.down4(x3, t_emb, aux_emb)
 
-        mid = self.middle(x3, t_emb, aux_emb)
+        mid = self.middle(x4, t_emb, aux_emb)
 
-        x = self.dec3(mid, t_emb, aux_emb) + x2
-        x = self.dec2(x, t_emb, aux_emb) + x1
-        x = self.dec1(x, t_emb, aux_emb)
-        x = self.final(x)
+        x = self.up3(mid, s3, t_emb, aux_emb)
+        x = self.up2(x, s2, t_emb, aux_emb)
+        x = self.up1(x, s1, t_emb, aux_emb)
+        x = self.up0(x, x[:, :0], t_emb, aux_emb)
 
-        return x
+        out = self.final(x)
+        return out
 
 
 class ConditionEncoder(nn.Module):
@@ -115,18 +128,28 @@ class DownBlock(nn.Module):
 
     def forward(self, x, t_emb, aux_emb):
         x = self.res(x, t_emb, aux_emb)
-        return self.down(x)
+        skip = x  # used in upsampling path
+        x = self.down(x)
+        return x, skip
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, embed_dim):
+    def __init__(self, in_channels, skip_channels, out_channels, embed_dim):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, embed_dim)
-        self.up = nn.ConvTranspose2d(out_channels, out_channels, 4, stride=2, padding=1)
+        self.up = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size=4, stride=2, padding=1
+        )
+        self.res = ResidualBlock(out_channels + skip_channels, out_channels, embed_dim)
 
-    def forward(self, x, t_emb, aux_emb):
+    def forward(self, x, skip, t_emb, aux_emb):
+        x = self.up(x)  # First upsample
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(
+                x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+            )
+        x = torch.cat([x, skip], dim=1)
         x = self.res(x, t_emb, aux_emb)
-        return self.up(x)
+        return x
 
 
 def cosine_beta_schedule(timesteps, s=0.008):
@@ -172,10 +195,15 @@ def train_satellitediffusionmodel(
     model, optimiser, model_path = load_model(
         save_model, model, dataset, learning_rate, device
     )
+    best_model_path = model_path.replace(".pth", "_best.pth")
+    model.train()
 
     betas = cosine_beta_schedule(num_timesteps)
     alphas = np.insert(np.cumprod(1.0 - betas), 0, 1.0)
     alphas = torch.tensor(alphas, dtype=torch.float32, device=device)
+
+    loss_prev = float("inf")
+    lost_best = float("inf")
 
     for epoch in range(num_epochs):
         sampler = SubsetRandomSampler(random.sample(range(len(dataset)), num_samples))
@@ -188,7 +216,6 @@ def train_satellitediffusionmodel(
             persistent_workers=persistent_workers,
         )
 
-        model.train()
         epoch_loss = 0
 
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
@@ -212,7 +239,9 @@ def train_satellitediffusionmodel(
 
             alpha_ref = 0.5
             rgb_noisy_ref = alpha_ref * rgb + (1 - alpha_ref) * noise
-            rgb_pred_ref = (rgb_noisy_ref - np.sqrt(1 - alpha_ref) * noise_pred) / np.sqrt(alpha_ref)
+            rgb_pred_ref = (
+                rgb_noisy_ref - np.sqrt(1 - alpha_ref) * noise_pred
+            ) / np.sqrt(alpha_ref)
             rgb_pred_ref = torch.clamp(rgb_pred_ref, 0, 1.0)
             rgb_loss = F.mse_loss(rgb_pred_ref, rgb)
             loss = noise_loss + rgb_loss_weight * rgb_loss
@@ -224,11 +253,35 @@ def train_satellitediffusionmodel(
             epoch_loss += loss.item()
 
         epoch_loss /= len(dataloader)
-        if save_model:
-            torch.save(model.state_dict(), model_path)
-        print(
-            f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d} - Loss: {epoch_loss:.4f}"
-        )
+        if (epoch_loss > loss_prev * 1e2) or (loss_prev < 0.5 and epoch_loss > 5):
+            print(
+                f"Loss increased from {loss_prev:.4f} to {epoch_loss:.4f}, backtracking..."
+            )
+            model, _, _ = load_model(save_model, model, dataset, learning_rate, device)
+        else:
+            print(
+                f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d} - Loss: {epoch_loss:.4f}"
+            )
+            loss_prev = epoch_loss
+            if save_model:
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimiser_state_dict": optimiser.state_dict(),
+                    },
+                    model_path,
+                )
+            if epoch_loss < lost_best:
+                lost_best = epoch_loss
+                if epoch > 10:
+                    torch.save(
+                        {
+                            "model_state_dict": model.state_dict(),
+                            "optimiser_state_dict": optimiser.state_dict(),
+                        },
+                        best_model_path,
+                    )
+                    print(f"Best model saved to {best_model_path}")
 
     return model
 
@@ -252,29 +305,29 @@ def load_model(save_model, model, dataset, learning_rate, device):
     out_channels = dataset[0]["target_image"].shape[0]
     aux_dim = dataset[0]["geoinfo_vector"].shape[0]
 
+    load_model_from_path = False
     if isinstance(model, nn.Module):
         model.to(device)
     elif isinstance(model, str) and os.path.exists(model):
-        model = SatelliteDiffusionUNet(
-            in_channels=in_channels, out_channels=out_channels, aux_input_dim=aux_dim
-        )
-        model.load_state_dict(torch.load(model, map_location=device))
-        print(f"Model loaded successfully from {model_path}")
+        model_path = model
+        load_model_from_path = True
     elif isinstance(model, str) and model == "load":
-        model = SatelliteDiffusionUNet(
-            in_channels=in_channels, out_channels=out_channels, aux_input_dim=aux_dim
-        )
         if os.path.exists(model_path):
-            print(f"Loading model from {model_path}")
-            model.load_state_dict(torch.load(model_path, map_location=device))
+            load_model_from_path = True
         else:
             print(f"Best model not found at {model_path}, starting from scratch")
-    elif isinstance(model, str) and model == "new":
-        model = SatelliteDiffusionUNet(
-            in_channels=in_channels, out_channels=out_channels, aux_input_dim=aux_dim
-        )
 
+    model = SatelliteDiffusionUNet(
+        in_channels=in_channels, out_channels=out_channels, aux_input_dim=aux_dim
+    )
+    if load_model_from_path:
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
+
     optimiser = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    if load_model_from_path:
+        optimiser.load_state_dict(checkpoint["optimiser_state_dict"])
+        print(f"Loaded model from {model_path}")
 
     return model, optimiser, model_path
