@@ -85,9 +85,9 @@ class DEMDataset(Dataset):
             if not be_quiet:
                 print(f"Using existing HDF5 file at {h5_path}...")
 
-        self.h5_file = h5py.File(h5_path, "r")
-        self.dem_data = self.h5_file["data"]
-        self.cond_data = self.h5_file["cond"]
+        h5_content = h5py.File(h5_path, "r")
+        self.dem_data = h5_content["data"]
+        self.cond_data = h5_content["cond"]
         self.num_tiles = self.dem_data.shape[0]
 
         self.indices = (
@@ -100,11 +100,10 @@ class DEMDataset(Dataset):
             with h5py.File(h5_path, "r") as f:
                 self.data = f["data"][:]
                 self.cond = f["cond"][:]
-            self.h5_file = None
         else:
-            self.h5_file = h5py.File(h5_path, "r")
-            self.data = self.h5_file["data"]
-            self.cond = self.h5_file["cond"]
+            h5_content = h5py.File(h5_path, "r")
+            self.data = h5_content["data"]
+            self.cond = h5_content["cond"]
 
         if not be_quiet:
             print(

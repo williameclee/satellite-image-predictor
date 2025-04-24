@@ -7,6 +7,10 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, SubsetRandomSampler
 import os
 
+from dem_diffusion_model import SinusoidalPosEmb, cosine_beta_schedule
+
+from dem_diffusion_model import ResidualBlock, DownBlock, UpBlock
+
 
 class SatelliteDiffusionUNet(nn.Module):
     def __init__(
@@ -14,52 +18,58 @@ class SatelliteDiffusionUNet(nn.Module):
         in_channels=3 + 2 + 20,  # image + dem + cloud + land cover
         out_channels=3,
         base_channels=64,
-        embed_dim=128,
+        time_embed_dim=128,
         aux_input_dim=10,
     ):
         super().__init__()
-        self.time_embed = TimeEmbedding(embed_dim)
-        self.cond_encoder = ConditionEncoder(aux_input_dim, embed_dim)
+        self.time_embedding = nn.Sequential(
+            SinusoidalPosEmb(time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+        self.cond_encoder = ConditionEncoder(aux_input_dim, time_embed_dim)
 
         # Downsampling blocks
-        self.down1 = DownBlock(in_channels, base_channels, embed_dim)
-        self.down2 = DownBlock(base_channels, base_channels * 2, embed_dim)
-        self.down3 = DownBlock(base_channels * 2, base_channels * 4, embed_dim)
-        self.down4 = DownBlock(base_channels * 4, base_channels * 8, embed_dim)
+        self.down1 = DownBlock(in_channels, base_channels, time_embed_dim)
+        self.down2 = DownBlock(base_channels, base_channels * 2, time_embed_dim)
+        self.down3 = DownBlock(base_channels * 2, base_channels * 4, time_embed_dim)
+        self.down4 = DownBlock(base_channels * 4, base_channels * 8, time_embed_dim)
 
         # Bottleneck
-        self.middle = ResidualBlock(base_channels * 8, base_channels * 8, embed_dim)
+        self.middle = ResidualBlock(
+            base_channels * 8, base_channels * 8, time_embed_dim
+        )
 
         # Upsampling blocks (with skip channels)
         self.up3 = UpBlock(
-            base_channels * 8, base_channels * 4, base_channels * 4, embed_dim
+            base_channels * 8, base_channels * 4, base_channels * 4, time_embed_dim
         )
         self.up2 = UpBlock(
-            base_channels * 4, base_channels * 2, base_channels * 2, embed_dim
+            base_channels * 4, base_channels * 2, base_channels * 2, time_embed_dim
         )
-        self.up1 = UpBlock(base_channels * 2, base_channels, base_channels, embed_dim)
-        self.up0 = UpBlock(base_channels, 0, base_channels // 2, embed_dim)
+        self.up1 = UpBlock(
+            base_channels * 2, base_channels, base_channels, time_embed_dim
+        )
 
-        # Final 1x1 convolution to project to output channels (e.g. 3 for RGB)
-        self.final = nn.Conv2d(base_channels // 2, out_channels, kernel_size=1)
+        self.final = nn.Conv2d(base_channels, out_channels, kernel_size=1)
 
     def forward(self, x, t, aux):
-        t_emb = self.time_embed(t)
+        t_emb = self.time_embedding(t)
         aux_emb = self.cond_encoder(aux)
 
-        x1, s1 = self.down1(x, t_emb, aux_emb)
-        x2, s2 = self.down2(x1, t_emb, aux_emb)
-        x3, s3 = self.down3(x2, t_emb, aux_emb)
-        x4, _ = self.down4(x3, t_emb, aux_emb)
+        down1, skip1 = self.down1(x, t_emb, aux_emb)
+        down2, skip2 = self.down2(down1, t_emb, aux_emb)
+        down3, skip3 = self.down3(down2, t_emb, aux_emb)
+        down4, _ = self.down4(down3, t_emb, aux_emb)
 
-        mid = self.middle(x4, t_emb, aux_emb)
+        mid = self.middle(down4, t_emb, aux_emb)
 
-        x = self.up3(mid, s3, t_emb, aux_emb)
-        x = self.up2(x, s2, t_emb, aux_emb)
-        x = self.up1(x, s1, t_emb, aux_emb)
-        x = self.up0(x, x[:, :0], t_emb, aux_emb)
+        up3 = self.up3(mid, skip3, t_emb, aux_emb)
+        up2 = self.up2(up3, skip2, t_emb, aux_emb)
+        up1 = self.up1(up2, skip1, t_emb, aux_emb)
 
-        out = self.final(x)
+        out = self.final(up1)
         return out
 
 
@@ -85,80 +95,60 @@ class ConditionEncoder(nn.Module):
         return self.aux_encoder(aux_vector)
 
 
-class TimeEmbedding(nn.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.embed = nn.Sequential(
-            nn.Linear(1, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim)
-        )
+# class ResidualBlock(nn.Module):
+#     def __init__(self, in_channels, out_channels, embed_dim):
+#         super().__init__()
+#         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+#         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+#         self.time_embed = nn.Linear(embed_dim, out_channels)
+#         self.aux_embed = nn.Linear(embed_dim, out_channels)
+#         self.activation = nn.ReLU()
 
-    def forward(self, t):
-        return self.embed(t.unsqueeze(-1))
+#         if in_channels != out_channels:
+#             self.skip = nn.Conv2d(in_channels, out_channels, 1)
+#         else:
+#             self.skip = nn.Identity()
 
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, embed_dim):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.time_embed = nn.Linear(embed_dim, out_channels)
-        self.aux_embed = nn.Linear(embed_dim, out_channels)
-        self.activation = nn.ReLU()
-
-        if in_channels != out_channels:
-            self.skip = nn.Conv2d(in_channels, out_channels, 1)
-        else:
-            self.skip = nn.Identity()
-
-    def forward(self, x, t_emb, aux_emb):
-        h = self.activation(self.conv1(x))
-        B, C, H, W = h.shape
-        t = self.time_embed(t_emb).view(B, C, 1, 1)
-        a = self.aux_embed(aux_emb).view(B, C, 1, 1)
-        h = h + t + a
-        h = self.conv2(self.activation(h))
-        return h + self.skip(x)
+#     def forward(self, x, t_emb, aux_emb):
+#         h = self.activation(self.conv1(x))
+#         B, C, H, W = h.shape
+#         t = self.time_embed(t_emb).view(B, C, 1, 1)
+#         a = self.aux_embed(aux_emb).view(B, C, 1, 1)
+#         h = h + t + a
+#         h = self.conv2(self.activation(h))
+#         return h + self.skip(x)
 
 
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, embed_dim):
-        super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, embed_dim)
-        self.down = nn.Conv2d(out_channels, out_channels, 4, stride=2, padding=1)
+# class DownBlock(nn.Module):
+#     def __init__(self, in_channels, out_channels, embed_dim):
+#         super().__init__()
+#         self.res = ResidualBlock(in_channels, out_channels, embed_dim)
+#         self.down = nn.Conv2d(out_channels, out_channels, 4, stride=2, padding=1)
 
-    def forward(self, x, t_emb, aux_emb):
-        x = self.res(x, t_emb, aux_emb)
-        skip = x  # used in upsampling path
-        x = self.down(x)
-        return x, skip
-
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, embed_dim):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size=4, stride=2, padding=1
-        )
-        self.res = ResidualBlock(out_channels + skip_channels, out_channels, embed_dim)
-
-    def forward(self, x, skip, t_emb, aux_emb):
-        x = self.up(x)  # First upsample
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(
-                x, size=skip.shape[-2:], mode="bilinear", align_corners=False
-            )
-        x = torch.cat([x, skip], dim=1)
-        x = self.res(x, t_emb, aux_emb)
-        return x
+#     def forward(self, x, t_emb, aux_emb):
+#         x = self.res(x, t_emb, aux_emb)
+#         skip = x  # used in upsampling path
+#         x = self.down(x)
+#         return x, skip
 
 
-def cosine_beta_schedule(timesteps, s=0.008):
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return betas.numpy()
+# class UpBlock(nn.Module):
+#     def __init__(self, in_channels, skip_channels, out_channels, embed_dim):
+#         super().__init__()
+#         self.up = nn.ConvTranspose2d(
+#             in_channels, out_channels, kernel_size=4, stride=2, padding=1
+#         )
+#         self.res = ResidualBlock(out_channels + skip_channels, out_channels, embed_dim)
+
+#     def forward(self, x, skip, t_emb, aux_emb):
+#         x = self.up(x)  # First upsample
+#         if x.shape[-2:] != skip.shape[-2:]:
+#             x = F.interpolate(
+#                 x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+#             )
+#         x = torch.cat([x, skip], dim=1)
+#         x = self.res(x, t_emb, aux_emb)
+#         return x
 
 
 def train_satellitediffusionmodel(
@@ -183,7 +173,7 @@ def train_satellitediffusionmodel(
     if subset_fraction < 1.0:
         num_epochs = round(round(num_epochs / subset_fraction))
         print(
-            f"Using {subset_fraction:.0%} of the dataset, training extended to {num_epochs} epochs"
+            f"Using {subset_fraction:.1%} of the dataset, training extended to {num_epochs} epochs"
         )
 
     print(f"Using device: {device}")
@@ -253,35 +243,50 @@ def train_satellitediffusionmodel(
             epoch_loss += loss.item()
 
         epoch_loss /= len(dataloader)
+
         if (epoch_loss > loss_prev * 1e2) or (loss_prev < 0.5 and epoch_loss > 5):
             print(
                 f"Loss increased from {loss_prev:.4f} to {epoch_loss:.4f}, backtracking..."
             )
-            model, _, _ = load_model(save_model, model, dataset, learning_rate, device)
-        else:
-            print(
-                f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d} - Loss: {epoch_loss:.4f}"
+            model, optimiser, _ = load_model(
+                save_model, model, dataset, learning_rate, device
             )
-            loss_prev = epoch_loss
-            if save_model:
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimiser_state_dict": optimiser.state_dict(),
-                    },
-                    model_path,
-                )
-            if epoch_loss < lost_best:
-                lost_best = epoch_loss
-                if epoch > 10:
-                    torch.save(
-                        {
-                            "model_state_dict": model.state_dict(),
-                            "optimiser_state_dict": optimiser.state_dict(),
-                        },
-                        best_model_path,
-                    )
-                    print(f"Best model saved to {best_model_path}")
+            continue
+
+        print(
+            f"Epoch {int(np.ceil((epoch+1)*subset_fraction)):04d}/{int(np.ceil(num_epochs*subset_fraction)):04d} - Loss: {epoch_loss:.4f}"
+        )
+        loss_prev = epoch_loss
+
+        # Model saving
+        if not save_model:
+            continue
+
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimiser_state_dict": optimiser.state_dict(),
+            },
+            model_path,
+        )
+
+        # Tracking best model
+        if epoch_loss >= lost_best:
+            continue
+
+        lost_best = epoch_loss
+
+        if epoch < 10:  # Save the best model only after 10 epochs
+            continue
+
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimiser_state_dict": optimiser.state_dict(),
+            },
+            best_model_path,
+        )
+        print(f"Best model saved to {best_model_path}")
 
     return model
 

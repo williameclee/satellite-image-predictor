@@ -6,7 +6,6 @@ import numpy as np
 import random
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from tqdm import tqdm
-import dem_dataset
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -24,8 +23,10 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
-class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim=None):
+        if cond_dim is None:
+            cond_dim = time_emb_dim
         super().__init__()
         self.norm1 = nn.BatchNorm2d(in_channels)
         self.act1 = nn.SiLU()
@@ -62,10 +63,12 @@ class ResBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
+    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim=None):
+        if cond_dim is None:
+            cond_dim = time_emb_dim
         super().__init__()
-        self.block1 = ResBlock(in_channels, out_channels, time_emb_dim, cond_dim)
-        self.block2 = ResBlock(out_channels, out_channels, time_emb_dim, cond_dim)
+        self.block1 = ResidualBlock(in_channels, out_channels, time_emb_dim, cond_dim)
+        self.block2 = ResidualBlock(out_channels, out_channels, time_emb_dim, cond_dim)
         self.pool = nn.MaxPool2d(2)
 
     def forward(self, x, t, c):
@@ -76,14 +79,16 @@ class DownBlock(nn.Module):
 
 class UpBlock(nn.Module):
     def __init__(
-        self, up_in_channels, skip_channels, out_channels, time_emb_dim, cond_dim
+        self, up_in_channels, skip_channels, out_channels, time_emb_dim, cond_dim=None
     ):
+        if cond_dim is None:
+            cond_dim = time_emb_dim
         super().__init__()
         self.upconv = nn.ConvTranspose2d(up_in_channels, out_channels, 2, stride=2)
-        self.block1 = ResBlock(
+        self.block1 = ResidualBlock(
             out_channels + skip_channels, out_channels, time_emb_dim, cond_dim
         )
-        self.block2 = ResBlock(out_channels, out_channels, time_emb_dim, cond_dim)
+        self.block2 = ResidualBlock(out_channels, out_channels, time_emb_dim, cond_dim)
 
     def forward(self, x, skip, t, c):
         x = self.upconv(x)
@@ -100,47 +105,49 @@ class DEMDiffusionModel(nn.Module):
         self,
         in_channels=1,
         out_channels=1,
-        time_emb_dim=128,
+        time_embed_dim=128,
         cond_dim=4,
         base_channels=64,
     ):
         super().__init__()
         self.time_embedding = nn.Sequential(
-            SinusoidalPosEmb(time_emb_dim),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            SinusoidalPosEmb(time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
             nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        self.down1 = DownBlock(in_channels, base_channels, time_emb_dim, cond_dim)
-        self.down2 = DownBlock(base_channels, base_channels * 2, time_emb_dim, cond_dim)
+        self.down1 = DownBlock(in_channels, base_channels, time_embed_dim, cond_dim)
+        self.down2 = DownBlock(
+            base_channels, base_channels * 2, time_embed_dim, cond_dim
+        )
         self.down3 = DownBlock(
-            base_channels * 2, base_channels * 4, time_emb_dim, cond_dim
+            base_channels * 2, base_channels * 4, time_embed_dim, cond_dim
         )
         self.down4 = DownBlock(
-            base_channels * 4, base_channels * 8, time_emb_dim, cond_dim
+            base_channels * 4, base_channels * 8, time_embed_dim, cond_dim
         )
 
-        self.middle = ResBlock(
-            base_channels * 8, base_channels * 8, time_emb_dim, cond_dim
+        self.middle = ResidualBlock(
+            base_channels * 8, base_channels * 8, time_embed_dim, cond_dim
         )
 
         self.up3 = UpBlock(
             base_channels * 8,
             base_channels * 4,
             base_channels * 4,
-            time_emb_dim,
+            time_embed_dim,
             cond_dim,
         )
         self.up2 = UpBlock(
             base_channels * 4,
             base_channels * 2,
             base_channels * 2,
-            time_emb_dim,
+            time_embed_dim,
             cond_dim,
         )
         self.up1 = UpBlock(
-            base_channels * 2, base_channels, base_channels, time_emb_dim, cond_dim
+            base_channels * 2, base_channels, base_channels, time_embed_dim, cond_dim
         )
 
         self.final_conv = nn.Sequential(
@@ -155,24 +162,24 @@ class DEMDiffusionModel(nn.Module):
             nn.Linear(base_channels, 3),
         )
 
-    def forward(self, x, t, c):
+    def forward(self, x, t, aux):
         t_emb = self.time_embedding(t)
 
-        d1_out, skip1 = self.down1(x, t_emb, c)
-        d2_out, skip2 = self.down2(d1_out, t_emb, c)
-        d3_out, skip3 = self.down3(d2_out, t_emb, c)
-        d4_out, _ = self.down4(d3_out, t_emb, c)
+        down1, skip1 = self.down1(x, t_emb, aux)
+        down2, skip2 = self.down2(down1, t_emb, aux)
+        down3, skip3 = self.down3(down2, t_emb, aux)
+        down4, _ = self.down4(down3, t_emb, aux)
 
-        mid = self.middle(d4_out, t_emb, c)
+        mid = self.middle(down4, t_emb, aux)
 
-        up3_out = self.up3(mid, skip3, t_emb, c)
-        up2_out = self.up2(up3_out, skip2, t_emb, c)
-        up1_out = self.up1(up2_out, skip1, t_emb, c)
+        up3 = self.up3(mid, skip3, t_emb, aux)
+        up2 = self.up2(up3, skip2, t_emb, aux)
+        up1 = self.up1(up2, skip1, t_emb, aux)
 
-        denoised = self.final_conv(up1_out)
-        aux_out = self.aux_head(up1_out)
+        out = self.final_conv(up1)
+        aux_out = self.aux_head(up1)
 
-        return denoised, aux_out
+        return out, aux_out
 
 
 def compute_slope_map(x):
