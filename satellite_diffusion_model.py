@@ -22,6 +22,10 @@ class SatelliteDiffusionUNet(nn.Module):
         aux_input_dim=10,
     ):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.aux_input_dim = aux_input_dim
+
         self.time_embedding = nn.Sequential(
             SinusoidalPosEmb(time_embed_dim),
             nn.Linear(time_embed_dim, time_embed_dim),
@@ -95,62 +99,6 @@ class ConditionEncoder(nn.Module):
         return self.aux_encoder(aux_vector)
 
 
-# class ResidualBlock(nn.Module):
-#     def __init__(self, in_channels, out_channels, embed_dim):
-#         super().__init__()
-#         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-#         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-#         self.time_embed = nn.Linear(embed_dim, out_channels)
-#         self.aux_embed = nn.Linear(embed_dim, out_channels)
-#         self.activation = nn.ReLU()
-
-#         if in_channels != out_channels:
-#             self.skip = nn.Conv2d(in_channels, out_channels, 1)
-#         else:
-#             self.skip = nn.Identity()
-
-#     def forward(self, x, t_emb, aux_emb):
-#         h = self.activation(self.conv1(x))
-#         B, C, H, W = h.shape
-#         t = self.time_embed(t_emb).view(B, C, 1, 1)
-#         a = self.aux_embed(aux_emb).view(B, C, 1, 1)
-#         h = h + t + a
-#         h = self.conv2(self.activation(h))
-#         return h + self.skip(x)
-
-
-# class DownBlock(nn.Module):
-#     def __init__(self, in_channels, out_channels, embed_dim):
-#         super().__init__()
-#         self.res = ResidualBlock(in_channels, out_channels, embed_dim)
-#         self.down = nn.Conv2d(out_channels, out_channels, 4, stride=2, padding=1)
-
-#     def forward(self, x, t_emb, aux_emb):
-#         x = self.res(x, t_emb, aux_emb)
-#         skip = x  # used in upsampling path
-#         x = self.down(x)
-#         return x, skip
-
-
-# class UpBlock(nn.Module):
-#     def __init__(self, in_channels, skip_channels, out_channels, embed_dim):
-#         super().__init__()
-#         self.up = nn.ConvTranspose2d(
-#             in_channels, out_channels, kernel_size=4, stride=2, padding=1
-#         )
-#         self.res = ResidualBlock(out_channels + skip_channels, out_channels, embed_dim)
-
-#     def forward(self, x, skip, t_emb, aux_emb):
-#         x = self.up(x)  # First upsample
-#         if x.shape[-2:] != skip.shape[-2:]:
-#             x = F.interpolate(
-#                 x, size=skip.shape[-2:], mode="bilinear", align_corners=False
-#             )
-#         x = torch.cat([x, skip], dim=1)
-#         x = self.res(x, t_emb, aux_emb)
-#         return x
-
-
 def train_satellitediffusionmodel(
     model,
     dataset,
@@ -168,7 +116,8 @@ def train_satellitediffusionmodel(
     num_workers=8,
     pin_memory=True,
     #
-    rgb_loss_weight=0.0,
+    rgb_loss_weight=2.0,
+    oob_loss_weight=0.5,
 ):
     if subset_fraction < 1.0:
         num_epochs = round(round(num_epochs / subset_fraction))
@@ -209,32 +158,51 @@ def train_satellitediffusionmodel(
         epoch_loss = 0
 
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            rgb = batch["target_image"].to(device)
-            geoinfo_spatial = batch["geoinfo_spatial"].to(device)
-            geoinfo_vector = batch["geoinfo_vector"].to(device)
+            rgb = batch["target_image"]
+            geoinfo_spatial = batch["geoinfo_spatial"]
+            geoinfo_vector = batch["geoinfo_vector"]
 
-            # 1. Sample timestep
+            # pad to the expected dimension
+            if geoinfo_spatial.shape[1] < model.in_channels - rgb.shape[1]:
+                pad_width = model.in_channels - geoinfo_spatial.shape[1] - rgb.shape[1]
+                geoinfo_spatial = F.pad(geoinfo_spatial, (0, 0, 0, 0, 0, pad_width))
+            if geoinfo_vector.shape[1] < model.aux_input_dim:
+                pad_width = model.aux_input_dim - geoinfo_vector.shape[1]
+                geoinfo_vector = F.pad(geoinfo_vector, (0, pad_width))
+            rgb = rgb.to(device)
+            geoinfo_spatial = geoinfo_spatial.to(device)
+            geoinfo_vector = geoinfo_vector.to(device)
+
+            # Sample timestep
             timestep = torch.randint(1, num_timesteps, (rgb.size(0),), device=device)
             alpha = alphas[timestep].view(-1, 1, 1, 1)
 
             noise = torch.randn_like(rgb)
             rgb_noisy = alpha.sqrt() * rgb + (1 - alpha).sqrt() * noise
 
-            # 3. Predict noise
+            # Predict noise
             t = timestep.float() / num_timesteps
             noise_pred = model(
                 torch.cat([rgb_noisy, geoinfo_spatial], dim=1), t, geoinfo_vector
             )
+
+            # Calculate loss
+            # Loss of noise prediction
             noise_loss = F.mse_loss(noise_pred, noise)
 
+            # Loss of RGB prediction
+            # constructed from a fixed alpha so that the loss is more stable
             alpha_ref = 0.5
             rgb_noisy_ref = alpha_ref * rgb + (1 - alpha_ref) * noise
-            rgb_pred_ref = (
+            rgb_pred_ref_clamp = (
                 rgb_noisy_ref - np.sqrt(1 - alpha_ref) * noise_pred
             ) / np.sqrt(alpha_ref)
-            rgb_pred_ref = torch.clamp(rgb_pred_ref, 0, 1.0)
-            rgb_loss = F.mse_loss(rgb_pred_ref, rgb)
-            loss = noise_loss + rgb_loss_weight * rgb_loss
+            rgb_pred_ref_clamp = torch.clamp(rgb_pred_ref_clamp, 0, 1.0)
+            # Penalise out-of-bounds pixels
+            oob_loss = F.mse_loss(rgb_pred_ref_clamp, rgb_noisy_ref)
+            # Penalise difference between predicted and actual RGB
+            rgb_loss = F.mse_loss(rgb_pred_ref_clamp, rgb)
+            loss = noise_loss + rgb_loss_weight * rgb_loss + oob_loss_weight * oob_loss
 
             optimiser.zero_grad()
             loss.backward()
@@ -292,6 +260,14 @@ def train_satellitediffusionmodel(
 
 
 def load_model(save_model, model, dataset, learning_rate, device):
+    # Calculate channel size first, as it is needed for the model path name
+    in_channels = max(
+        dataset[0]["target_image"].shape[0] + dataset[0]["geoinfo_spatial"].shape[0],
+        16,
+    )
+    out_channels = dataset[0]["target_image"].shape[0]
+    aux_dim = max(dataset[0]["geoinfo_vector"].shape[0], 16)
+
     if isinstance(save_model, str) and os.path.exists(save_model):
         model_path = save_model
         save_model = True
@@ -299,16 +275,8 @@ def load_model(save_model, model, dataset, learning_rate, device):
         os.makedirs("models", exist_ok=True)
         model_path = os.path.join(
             "models",
-            f"satellite_diffusion-T{dataset.size[0]}-A{len(dataset.geoinfo_keys)}.pth",
+            f"satellite_diffusion-T{dataset.size[0]:04d}-L{dataset.lct_classes}-I{in_channels}_{aux_dim}.pth",
         )
-    if save_model:
-        print(f"Model will be saved to {model_path}")
-
-    in_channels = (
-        dataset[0]["target_image"].shape[0] + dataset[0]["geoinfo_spatial"].shape[0]
-    )
-    out_channels = dataset[0]["target_image"].shape[0]
-    aux_dim = dataset[0]["geoinfo_vector"].shape[0]
 
     load_model_from_path = False
     if isinstance(model, nn.Module):
@@ -333,6 +301,9 @@ def load_model(save_model, model, dataset, learning_rate, device):
     optimiser = torch.optim.Adam(model.parameters(), lr=learning_rate)
     if load_model_from_path:
         optimiser.load_state_dict(checkpoint["optimiser_state_dict"])
-        print(f"Loaded model from {model_path}")
+        if not save_model:
+            print(f"Loaded model from {model_path}")
+        else:
+            print(f"Loaded model from and will be saved to {model_path}")
 
     return model, optimiser, model_path

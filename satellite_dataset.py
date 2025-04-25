@@ -16,6 +16,7 @@ class SatelliteDataset(Dataset):
         data_dir,
         geoinfo_keys=None,
         size=(256, 256),
+        rotate=False,
         preload_to_ram=False,
         lct_classes=20,
     ):
@@ -34,10 +35,14 @@ class SatelliteDataset(Dataset):
         ]
 
         if not os.path.exists(data_dir):
-            try:
-                data_dir = os.path.join("training-data", data_dir)
-            except FileNotFoundError:
-                raise FileNotFoundError(f"Dataset directory {data_dir} not found.")
+            data_dir = os.path.join(
+                "training-data", f"{data_dir}-T{size[0]:04d}-R{int(rotate)}"
+            )
+        if not os.path.exists(data_dir):
+            raise FileNotFoundError(
+                f"Dataset directory {data_dir} not found in training-data."
+            )
+
         self.data_dir = data_dir
 
         if preload_to_ram:
