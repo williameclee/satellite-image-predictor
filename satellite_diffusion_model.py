@@ -116,8 +116,8 @@ def train_satellitediffusionmodel(
     num_workers=8,
     pin_memory=True,
     #
-    rgb_loss_weight=2.0,
-    oob_loss_weight=0.5,
+    rgb_loss_weight=0.0,
+    oob_loss_weight=0.0,
 ):
     if subset_fraction < 1.0:
         num_epochs = round(round(num_epochs / subset_fraction))
@@ -192,17 +192,22 @@ def train_satellitediffusionmodel(
 
             # Loss of RGB prediction
             # constructed from a fixed alpha so that the loss is more stable
-            alpha_ref = 0.5
-            rgb_noisy_ref = alpha_ref * rgb + (1 - alpha_ref) * noise
-            rgb_pred_ref_clamp = (
-                rgb_noisy_ref - np.sqrt(1 - alpha_ref) * noise_pred
-            ) / np.sqrt(alpha_ref)
-            rgb_pred_ref_clamp = torch.clamp(rgb_pred_ref_clamp, 0, 1.0)
-            # Penalise out-of-bounds pixels
-            oob_loss = F.mse_loss(rgb_pred_ref_clamp, rgb_noisy_ref)
-            # Penalise difference between predicted and actual RGB
-            rgb_loss = F.mse_loss(rgb_pred_ref_clamp, rgb)
-            loss = noise_loss + rgb_loss_weight * rgb_loss + oob_loss_weight * oob_loss
+            if rgb_loss_weight > 0 or oob_loss_weight > 0:
+                alpha_ref = 0.5
+                rgb_noisy_ref = alpha_ref * rgb + (1 - alpha_ref) * noise
+                rgb_pred_ref_clamp = (
+                    rgb_noisy_ref - np.sqrt(1 - alpha_ref) * noise_pred
+                ) / np.sqrt(alpha_ref)
+                rgb_pred_ref_clamp = torch.clamp(rgb_pred_ref_clamp, 0, 1.0)
+                # Penalise out-of-bounds pixels
+                oob_loss = F.mse_loss(rgb_pred_ref_clamp, rgb_noisy_ref)
+                # Penalise difference between predicted and actual RGB
+                rgb_loss = F.mse_loss(rgb_pred_ref_clamp, rgb)
+                loss = (
+                    noise_loss + rgb_loss_weight * rgb_loss + oob_loss_weight * oob_loss
+                )
+            else:
+                loss = noise_loss
 
             optimiser.zero_grad()
             loss.backward()
@@ -275,7 +280,7 @@ def load_model(save_model, model, dataset, learning_rate, device):
         os.makedirs("models", exist_ok=True)
         model_path = os.path.join(
             "models",
-            f"satellite_diffusion-T{dataset.size[0]:04d}-L{dataset.lct_classes}-I{in_channels}_{aux_dim}.pth",
+            f"satellite_diffusion-T{dataset.size[0]:04d}-L{dataset.lct_classes}-N{int(dataset.normalise)}-I{in_channels}_{aux_dim}.pth",
         )
 
     load_model_from_path = False

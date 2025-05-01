@@ -18,11 +18,13 @@ class SatelliteDataset(Dataset):
         size=(256, 256),
         rotate=False,
         preload_to_ram=False,
+        normalise=True,
         lct_classes=20,
     ):
         self.size = size
         self.lct_classes = lct_classes
         self.preload_to_ram = preload_to_ram
+        self.normalise = normalise
 
         self.geoinfo_keys = geoinfo_keys or [
             "dem_mean",
@@ -50,6 +52,7 @@ class SatelliteDataset(Dataset):
                 self.data_dir,
                 geoinfo_keys=self.geoinfo_keys,
                 lct_classes=self.lct_classes,
+                normalise=self.normalise,
             )
             h5_content = h5py.File(self.h5_path, "r")
             self.geoinfo_vector_data = torch.from_numpy(h5_content["geoinfo_vector"][:])
@@ -78,48 +81,79 @@ class SatelliteDataset(Dataset):
                 "geoinfo_spatial": self.geoinfo_spatial_data[idx],
                 "geoinfo_vector": self.geoinfo_vector_data[idx],
             }
-        else:
-            meta_file = self.tiles[idx]
-            return load_data_from_metadata(
-                self.data_dir,
-                meta_file,
-                size=self.size,
-                geoinfo_keys=self.geoinfo_keys,
-                lct_classes=self.lct_classes,
-            )
+        # Else, load data from metadata
+        meta_file = self.tiles[idx]
+        return load_data_from_metadata(
+            self.data_dir,
+            meta_file,
+            size=self.size,
+            geoinfo_keys=self.geoinfo_keys,
+            lct_classes=self.lct_classes,
+            normalise=self.normalise,
+        )
 
 
 def load_data_from_metadata(
-    input_dir, meta_file, size, geoinfo_keys=None, lct_classes=20
+    input_dir, meta_file, size, geoinfo_keys=None, lct_classes=20, normalise=True
 ):
     with open(os.path.join(input_dir, meta_file)) as f:
         meta = json.load(f)
 
-    # --- Load satellite image ---
+    # RGB
     rgb_path = os.path.join(input_dir, meta["tiles"]["rgb"])
     with rasterio.open(rgb_path) as src:
         rgb = src.read(out_shape=(3, *size)).astype(np.float32) / 255.0
 
-    # --- Load DEM ---
+    # DEM
     dem_path = os.path.join(input_dir, meta["tiles"]["dem"])
     with rasterio.open(dem_path) as src:
         dem = src.read(1, out_shape=(1, *size)).astype(np.float32)
         dem, meta["dem_mean"], meta["dem_min"], meta["dem_max"] = normalise_dem(dem)
 
-    # --- Load land cover type ---
+    # Land cover type
     lct_path = os.path.join(input_dir, meta["tiles"]["lct"])
     with rasterio.open(lct_path) as src:
         lc = src.read(1, out_shape=size).astype(np.float32)[None, ...]
         lc = lc / lct_classes
 
-    # --- Load cloud mask ---
+    # Cloud mask
     cld_path = os.path.join(input_dir, meta["tiles"]["cld"])
     with rasterio.open(cld_path) as src:
         cloud_mask = src.read(1, out_shape=(1, *size))[None, ...]
 
-    # --- Auxiliary scalar vector ---
+    # Scalar information
     if geoinfo_keys is not None:
         geoinfo_vector = [meta[k] for k in geoinfo_keys]
+        if normalise:
+            # normalise month to [0, 1]
+            if "month" in geoinfo_keys:
+                lat = meta["centre_lat"]
+                geoinfo_vector[geoinfo_keys.index("month")] = (
+                    np.mod(
+                        geoinfo_vector[geoinfo_keys.index("month")] + 6 * lat < 0, 12
+                    )
+                ) / 11.0
+            # normalise solar azimuth to [0, 1]
+            if "solar_azimuth" in geoinfo_keys:
+                geoinfo_vector[geoinfo_keys.index("solar_azimuth")] = (
+                    np.mod(
+                        geoinfo_vector[geoinfo_keys.index("solar_azimuth")]
+                        + meta["north_dir"],
+                        360,
+                    )
+                    / 360.0
+                )
+            # normalise solar zenith to [0, 1]
+            if "solar_zenith" in geoinfo_keys:
+                geoinfo_vector[geoinfo_keys.index("solar_zenith")] = (
+                    geoinfo_vector[geoinfo_keys.index("solar_zenith")] / 90.0
+                )
+            # normalise solar zenith to [0, 1]
+            if "north_dir" in geoinfo_keys:
+                geoinfo_vector[geoinfo_keys.index("north_dir")] = (
+                    geoinfo_vector[geoinfo_keys.index("north_dir")] / 360.0
+                )
+
         geoinfo_vector_tensor = torch.tensor(geoinfo_vector, dtype=torch.float32)
     else:
         geoinfo_vector_tensor = torch.tensor([0.0])
@@ -144,6 +178,7 @@ def save_dataset_to_h5(
     output_path=None,
     geoinfo_keys=None,
     lct_classes=20,
+    normalise=True,
     overwrite=False,
     be_quiet=False,
 ):
@@ -153,7 +188,12 @@ def save_dataset_to_h5(
             geoinfo_key_name = "-K" + "_".join(geoinfo_keys)
         else:
             geoinfo_key_name = ""
-        output_name = f"{base}-L{lct_classes}{geoinfo_key_name}.h5"
+        if normalise:
+            normalise_key_name = "-N"
+        else:
+            normalise_key_name = ""
+
+        output_name = f"{base}-L{lct_classes}{normalise_key_name}{geoinfo_key_name}.h5"
         output_path = os.path.join(os.path.dirname(input_dir), output_name)
     if not be_quiet:
         if not overwrite and os.path.exists(output_path):
@@ -182,6 +222,7 @@ def save_dataset_to_h5(
             meta_file,
             size=(256, 256),
             geoinfo_keys=geoinfo_keys,
+            normalise=normalise,
         )
 
         all_target_images.append(tile["target_image"].numpy())
@@ -221,46 +262,3 @@ def save_dataset_to_h5(
         print(f"  - geoinfo_vector shape: {all_geoinfo_vector.shape}")
 
     return output_path
-
-
-# def save_dataset_to_h5(dataset, output_path=None, be_quiet=False, only_check=False):
-#     if output_path is None:
-#         output_name = (
-#             f"{os.path.basename(dataset.data_dir)}-K{'_'.join(dataset.geoinfo_keys)}.h5"
-#         )
-#         output_path = os.path.join(
-#             os.path.dirname(dataset.data_dir), output_name
-#         )  # Default path in the parent directory
-#     if os.path.exists(output_path):
-#         if not be_quiet:
-#             print(f"Output file {output_path} already exists.")
-#         return output_path
-#     elif only_check:
-#         return None
-
-#     with h5py.File(output_path, "w") as h5f:
-#         for i in range(len(dataset)):
-#             sample = dataset[i]
-#             tid = dataset.tiles[i].split("_")[1]
-#             g = h5f.create_group(f"tile_{tid}")
-#             g.create_dataset(
-#                 "target_image",
-#                 data=sample["target_image"].numpy(),
-#                 compression="gzip",
-#                 chunks=True,
-#             )
-#             g.create_dataset(
-#                 "geoinfo_spatial",
-#                 data=sample["geoinfo_spatial"].numpy(),
-#                 compression="gzip",
-#                 chunks=True,
-#             )
-#             g.create_dataset(
-#                 "geoinfo_vector",
-#                 data=sample["geoinfo_vector"].numpy(),
-#                 compression="gzip",
-#                 chunks=True,
-#             )
-#     if not be_quiet:
-#         print(f"Saved dataset to {output_path}")
-#     return output_path
