@@ -16,7 +16,7 @@ class SatelliteDataset(Dataset):
         data_dir,
         geoinfo_keys=None,
         size=(256, 256),
-        rotate=False,
+        rotate=0,
         preload_to_ram=False,
         normalise=True,
         lct_classes=20,
@@ -38,7 +38,7 @@ class SatelliteDataset(Dataset):
 
         if not os.path.exists(data_dir):
             data_dir = os.path.join(
-                "training-data", f"{data_dir}-T{size[0]:04d}-R{int(rotate)}"
+                "training-data", f"{data_dir}-T{size[0]:04d}-R{int(rotate):03d}"
             )
         if not os.path.exists(data_dir):
             raise FileNotFoundError(
@@ -47,13 +47,13 @@ class SatelliteDataset(Dataset):
 
         self.data_dir = data_dir
 
+        self.h5_path = save_dataset_to_h5(
+            self.data_dir,
+            geoinfo_keys=self.geoinfo_keys,
+            lct_classes=self.lct_classes,
+            normalise=self.normalise,
+        )
         if preload_to_ram:
-            self.h5_path = save_dataset_to_h5(
-                self.data_dir,
-                geoinfo_keys=self.geoinfo_keys,
-                lct_classes=self.lct_classes,
-                normalise=self.normalise,
-            )
             h5_content = h5py.File(self.h5_path, "r")
             self.geoinfo_vector_data = torch.from_numpy(h5_content["geoinfo_vector"][:])
             print(f"  - geoinfo_vector shape: {self.geoinfo_vector_data.shape}")
@@ -82,8 +82,15 @@ class SatelliteDataset(Dataset):
                 "geoinfo_vector": self.geoinfo_vector_data[idx],
             }
         # Else, load data from metadata
+        # h5_content = h5py.File(self.h5_path, "r", libver="latest", swmr=True)
+        # return {
+        #     "target_image": torch.from_numpy(h5_content["target_image"][idx]),
+        #     "geoinfo_spatial": torch.from_numpy(h5_content["geoinfo_spatial"][idx]),
+        #     "geoinfo_vector": torch.from_numpy(h5_content["geoinfo_vector"][idx]),
+        #     "tile_id": h5_content["tile_id"][idx].decode("utf-8"),
+        # }
         meta_file = self.tiles[idx]
-        return load_data_from_metadata(
+        data = load_data_from_metadata(
             self.data_dir,
             meta_file,
             size=self.size,
@@ -91,6 +98,8 @@ class SatelliteDataset(Dataset):
             lct_classes=self.lct_classes,
             normalise=self.normalise,
         )
+        data["tile_id"] = meta_file.replace("_met.json", "")
+        return data
 
 
 def load_data_from_metadata(
@@ -128,11 +137,11 @@ def load_data_from_metadata(
             # normalise month to [0, 1]
             if "month" in geoinfo_keys:
                 lat = meta["centre_lat"]
-                geoinfo_vector[geoinfo_keys.index("month")] = (
-                    np.mod(
-                        geoinfo_vector[geoinfo_keys.index("month")] + 6 * lat < 0, 12
-                    )
-                ) / 11.0
+                month = geoinfo_vector[geoinfo_keys.index("month")] + 6 * int(lat < 0)
+                month = np.mod(month, 12)
+                month = month + 12 * int(month <= 0)
+                month = month / 12.0
+                geoinfo_vector[geoinfo_keys.index("month")] = month
             # normalise solar azimuth to [0, 1]
             if "solar_azimuth" in geoinfo_keys:
                 geoinfo_vector[geoinfo_keys.index("solar_azimuth")] = (
@@ -170,6 +179,7 @@ def load_data_from_metadata(
         "target_image": rgb_tensor,
         "geoinfo_spatial": geoinfo_spatial_tensor,
         "geoinfo_vector": geoinfo_vector_tensor,
+        "tile_id": meta_file.replace("_met.json", ""),
     }
 
 
@@ -209,56 +219,70 @@ def save_dataset_to_h5(
         return output_path
 
     json_files = sorted([f for f in os.listdir(input_dir) if f.endswith("_met.json")])
-    if len(json_files) == 0:
+    num_samples = len(json_files)
+    if num_samples == 0:
         raise ValueError("No .json metadata files found in input directory")
 
-    all_target_images = []
-    all_geoinfo_spatial = []
-    all_geoinfo_vector = []
+    dummy_tile = load_data_from_metadata(
+        input_dir,
+        json_files[0],
+        size=(256, 256),
+        geoinfo_keys=geoinfo_keys,
+        normalise=normalise,
+    )
 
-    for meta_file in tqdm(json_files, desc="Processing tiles"):
-        tile = load_data_from_metadata(
-            input_dir,
-            meta_file,
-            size=(256, 256),
-            geoinfo_keys=geoinfo_keys,
-            normalise=normalise,
-        )
+    geoinfo_spatial_dim = dummy_tile["geoinfo_spatial"].numpy().shape[0]
+    geoinfo_vector_dim = len(geoinfo_keys) if geoinfo_keys is not None else 1
 
-        all_target_images.append(tile["target_image"].numpy())
-        all_geoinfo_spatial.append(tile["geoinfo_spatial"].numpy())
-        all_geoinfo_vector.append(tile["geoinfo_vector"].numpy())
-
-    all_target_images = np.stack(all_target_images, axis=0)
-    all_geoinfo_spatial = np.stack(all_geoinfo_spatial, axis=0)
-    all_geoinfo_vector = np.stack(all_geoinfo_vector, axis=0)
-
+    # Open HDF5 file for incremental writing
     with h5py.File(output_path, "w") as h5f:
+        # Create empty datasets with appropriate shapes
         h5f.create_dataset(
             "target_image",
-            data=all_target_images,
+            shape=(num_samples, 3, 256, 256),  # Adjust shape as needed
             dtype=np.float32,
             compression="gzip",
-            chunks=True,
+            chunks=(1, 3, 256, 256),
         )
         h5f.create_dataset(
             "geoinfo_spatial",
-            data=all_geoinfo_spatial,
+            shape=(num_samples, geoinfo_spatial_dim, 256, 256),
             dtype=np.float32,
             compression="gzip",
-            chunks=True,
+            chunks=(1, geoinfo_spatial_dim, 256, 256),
         )
         h5f.create_dataset(
             "geoinfo_vector",
-            data=all_geoinfo_vector,
+            shape=(num_samples, geoinfo_vector_dim),
             dtype=np.float32,
             compression="gzip",
-            chunks=True,
+            chunks=(1, geoinfo_vector_dim),
         )
+
+        dt = h5py.string_dtype(encoding="utf-8", length=10)
+        h5f.create_dataset(
+            "tile_id",
+            shape=(num_samples,),
+            dtype=dt,
+        )
+
+        # Process and write data incrementally
+        for i, meta_file in enumerate(tqdm(json_files, desc="Processing tiles")):
+            tile = load_data_from_metadata(
+                input_dir,
+                meta_file,
+                size=(256, 256),
+                geoinfo_keys=geoinfo_keys,
+                normalise=normalise,
+            )
+
+            # Write each sample to the HDF5 file
+            h5f["target_image"][i] = tile["target_image"].numpy()
+            h5f["geoinfo_spatial"][i] = tile["geoinfo_spatial"].numpy()
+            h5f["geoinfo_vector"][i] = tile["geoinfo_vector"].numpy()
+            h5f["tile_id"][i] = meta_file.replace("_met.json", "")
+
     if not be_quiet:
         print(f"Compressed dataset saved to {output_path}")
-        print(f"  - target_image shape: {all_target_images.shape}")
-        print(f"  - geoinfo_spatial shape: {all_geoinfo_spatial.shape}")
-        print(f"  - geoinfo_vector shape: {all_geoinfo_vector.shape}")
 
     return output_path

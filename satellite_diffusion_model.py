@@ -15,16 +15,18 @@ from dem_diffusion_model import ResidualBlock, DownBlock, UpBlock
 class SatelliteDiffusionUNet(nn.Module):
     def __init__(
         self,
-        in_channels=3 + 2 + 20,  # image + dem + cloud + land cover
+        in_channels=16,
         out_channels=3,
-        base_channels=64,
+        base_channels=128,
         time_embed_dim=128,
         aux_input_dim=10,
+        v_prediction=False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.aux_input_dim = aux_input_dim
+        self.v_prediction = v_prediction
 
         self.time_embedding = nn.Sequential(
             SinusoidalPosEmb(time_embed_dim),
@@ -41,9 +43,10 @@ class SatelliteDiffusionUNet(nn.Module):
         self.down4 = DownBlock(base_channels * 4, base_channels * 8, time_embed_dim)
 
         # Bottleneck
-        self.middle = ResidualBlock(
-            base_channels * 8, base_channels * 8, time_embed_dim
-        )
+        # self.middle = ResidualBlock(
+        #     base_channels * 8, base_channels * 8, time_embed_dim
+        # )
+        self.middle = Bottleneck(base_channels * 8, time_embed_dim)
 
         # Upsampling blocks (with skip channels)
         self.up3 = UpBlock(
@@ -99,6 +102,39 @@ class ConditionEncoder(nn.Module):
         return self.aux_encoder(aux_vector)
 
 
+class Bottleneck(nn.Module):
+    def __init__(self, channels, time_embed_dim):
+        super().__init__()
+        self.res1 = ResidualBlock(channels, channels, time_embed_dim)
+        self.attn = AttentionBlock(channels)
+        self.res2 = ResidualBlock(channels, channels, time_embed_dim)
+
+    def forward(self, x, t_emb, aux_emb):
+        x = self.res1(x, t_emb, aux_emb)
+        x = self.attn(x)  # AttentionBlock only takes the tensor
+        x = self.res2(x, t_emb, aux_emb)
+        return x
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads)
+        self.proj = nn.Linear(channels, channels)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = x.flatten(2).permute(2, 0, 1)  # Reshape to (seq_len, batch, channels)
+        x = self.norm(x)
+        x, _ = self.attn(x, x, x)
+        x = self.proj(x)
+        x = x.permute(1, 2, 0).view(
+            b, c, h, w
+        )  # Reshape back to (batch, channels, h, w)
+        return x
+
+
 def train_satellitediffusionmodel(
     model,
     dataset,
@@ -115,9 +151,7 @@ def train_satellitediffusionmodel(
     ),
     num_workers=8,
     pin_memory=True,
-    #
-    rgb_loss_weight=0.0,
-    oob_loss_weight=0.0,
+    v_prediction=False,
 ):
     if subset_fraction < 1.0:
         num_epochs = round(round(num_epochs / subset_fraction))
@@ -132,7 +166,16 @@ def train_satellitediffusionmodel(
     num_samples = max(int(len(dataset) * subset_fraction), 1)
 
     model, optimiser, model_path = load_model(
-        save_model, model, dataset, learning_rate, device
+        save_model,
+        model,
+        dataset,
+        v_prediction,
+        learning_rate,
+        device=(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available() else "cpu"
+        ),
     )
     best_model_path = model_path.replace(".pth", "_best.pth")
     model.train()
@@ -182,35 +225,23 @@ def train_satellitediffusionmodel(
 
             # Predict noise
             t = timestep.float() / num_timesteps
-            noise_pred = model(
-                torch.cat([rgb_noisy, geoinfo_spatial], dim=1), t, geoinfo_vector
-            )
 
-            # Calculate loss
-            # Loss of noise prediction
-            noise_loss = F.mse_loss(noise_pred, noise)
-
-            # Loss of RGB prediction
-            # constructed from a fixed alpha so that the loss is more stable
-            if rgb_loss_weight > 0 or oob_loss_weight > 0:
-                alpha_ref = 0.5
-                rgb_noisy_ref = alpha_ref * rgb + (1 - alpha_ref) * noise
-                rgb_pred_ref_clamp = (
-                    rgb_noisy_ref - np.sqrt(1 - alpha_ref) * noise_pred
-                ) / np.sqrt(alpha_ref)
-                rgb_pred_ref_clamp = torch.clamp(rgb_pred_ref_clamp, 0, 1.0)
-                # Penalise out-of-bounds pixels
-                oob_loss = F.mse_loss(rgb_pred_ref_clamp, rgb_noisy_ref)
-                # Penalise difference between predicted and actual RGB
-                rgb_loss = F.mse_loss(rgb_pred_ref_clamp, rgb)
-                loss = (
-                    noise_loss + rgb_loss_weight * rgb_loss + oob_loss_weight * oob_loss
+            if v_prediction:
+                v = alpha.sqrt() * noise - (1 - alpha).sqrt() * rgb
+                v_pred = model(
+                    torch.cat([rgb_noisy, geoinfo_spatial], dim=1), t, geoinfo_vector
                 )
+                loss = F.mse_loss(v_pred, v)
             else:
-                loss = noise_loss
+                noise_pred = model(
+                    torch.cat([rgb_noisy, geoinfo_spatial], dim=1), t, geoinfo_vector
+                )
+                loss = F.mse_loss(noise_pred, noise)
 
             optimiser.zero_grad()
             loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimiser.step()
 
             epoch_loss += loss.item()
@@ -264,7 +295,18 @@ def train_satellitediffusionmodel(
     return model
 
 
-def load_model(save_model, model, dataset, learning_rate, device):
+def load_model(
+    save_model,
+    model,
+    dataset,
+    v_prediction=False,
+    learning_rate=1e-4,
+    device=(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available() else "cpu"
+    ),
+):
     # Calculate channel size first, as it is needed for the model path name
     in_channels = max(
         dataset[0]["target_image"].shape[0] + dataset[0]["geoinfo_spatial"].shape[0],
@@ -278,9 +320,13 @@ def load_model(save_model, model, dataset, learning_rate, device):
         save_model = True
     else:
         os.makedirs("models", exist_ok=True)
+        if v_prediction:
+            v_prediction_str = "-V"
+        else:
+            v_prediction_str = ""
         model_path = os.path.join(
             "models",
-            f"satellite_diffusion-T{dataset.size[0]:04d}-L{dataset.lct_classes}-N{int(dataset.normalise)}-I{in_channels}_{aux_dim}.pth",
+            f"satellite_diffusion{v_prediction_str}-T{dataset.size[0]:04d}-L{dataset.lct_classes}-N{int(dataset.normalise)}-I{in_channels}_{aux_dim}.pth",
         )
 
     load_model_from_path = False
@@ -296,14 +342,19 @@ def load_model(save_model, model, dataset, learning_rate, device):
             print(f"Best model not found at {model_path}, starting from scratch")
 
     model = SatelliteDiffusionUNet(
-        in_channels=in_channels, out_channels=out_channels, aux_input_dim=aux_dim
+        in_channels=in_channels,
+        out_channels=out_channels,
+        aux_input_dim=aux_dim,
+        v_prediction=v_prediction,
     )
     if load_model_from_path:
         checkpoint = torch.load(model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
 
-    optimiser = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimiser = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=1e-4
+    )
     if load_model_from_path:
         optimiser.load_state_dict(checkpoint["optimiser_state_dict"])
         if not save_model:
